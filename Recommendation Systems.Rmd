@@ -1,0 +1,243 @@
+---
+title: "Explicit and Implicit Recommendation Systems in Spark"
+author: "Ansar Butt"
+date: "February 13, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading packages and Spark connection
+
+```{r, eval = FALSE}
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(data.table)
+
+# install.packages("devtools")
+require(devtools)
+# On February 2nd 2018 the CAC's default sparklyr version is 0.7.0, and it has a different internal structure list for ML_ALS that contains features only compatible with Spark 2.2+ - hence we are using an older version
+install_version("sparklyr", version = "0.6.4", repos = "http://cran.us.r-project.org")
+library(sparklyr)
+set.seed(1805)
+
+config <- spark_config()
+config$spark.executor.memory <- "15G" 
+config$spark.driver.memory <- "20GB"
+config$spark.yarn.executor.memoryOverhead <- "5g"
+config$spark.port.maxRetries <- 128
+sc <- spark_connect(master = "yarn-client", config = config)  
+
+```
+
+## Load the Movie data
+
+```{r, eval = FALSE}
+hdfs_path = '/user/hpc3552/movie2018/sample04/'
+
+# First, put all the file names in a list, so we can loop through them.
+file_names = c(
+  "MovieAnalytics.dbo.SP_Points.csv",
+  "MovieAnalytics.dbo.SP_PointsType.csv"
+)
+
+# Spark wants you to give each table a name; we can't have dots in the name, so remove them here.
+tbl_names = file_names
+tbl_names = gsub(".csv", "", tbl_names)
+tbl_names = gsub("MovieAnalytics.dbo.", "", tbl_names)
+
+# This list will hold all of the actual Spark tables that have been read in.
+tbls = list()
+
+# Now, actually loop through the list, open each file, and save the results into `tbls`
+for (i in 1:length(file_names)){
+  tmp <- spark_read_csv(sc, name=tbl_names[i], path=paste(hdfs_path, file_names[i], sep=""),
+                        header = TRUE, delimiter = ",")
+  
+  tbls[tbl_names[i]] = list(tmp)
+}
+  
+
+```
+
+
+## Data Preparation
+
+In the below snippet of code I am preparing the data for both Explicit and Implicit ALS. 
+
+The first step is transform the Unique IDs into numeric identities. 
+
+For the Explicit Feedback System, I am bucketing transactions into quantiles, which represent the 5-star ratings used in this algorithm. 
+
+For the Implicit Feedback System I am using the logarithm of the number of transactions. The logarithm is an attempt to reduce the variance in the number of transactions. 
+
+To reduce the sparsity of the user-item matrix, I filtered for greater than 5 transactions. While this is a static number, ideally in production this filter would be altered and performance would be evaluated.  
+
+```{r, eval = FALSE}
+
+#Join the SP_Points table to the SP_PointsType to get the Points descriptions
+joinedPoints <-  left_join(tbls$SP_Points, tbls$SP_PointsType, by = "pointtypeid")
+
+#Convert the Unique_member_identifier to a numeric Unique ID
+UniqueIDConversion <- joinedPoints %>%
+  distinct(Unique_member_identifier) %>%
+  arrange(Unique_member_identifier) %>%
+  sdf_with_sequential_id("UniqueID", from = 1L)
+
+#Store all the IDs in a list, this is used for diagnostic purposes
+UniqueIDs <- UniqueIDConversion %>%
+  select(UniqueID)
+
+#Join the numeric Unique IDs back to the Points dataset
+baseTable <- left_join(joinedPoints, UniqueIDConversion, by = "Unique_member_identifier")
+
+#Construct a dataset that summarizes each customer with the number of transactions they made for each point type
+NumTransMatrix <-
+  baseTable %>%
+  select(UniqueID, pointtypeid, TransAmount) %>%
+  group_by(UniqueID, pointtypeid) %>%
+  arrange(UniqueID) %>%
+  summarize(numTrans = n()) %>%
+  filter (numTrans > 5) 
+
+#Construct a dataset that creates a quantile transaction based rating system for each user's point type transaction frequency
+RatingMatrix <- NumTransMatrix %>%
+  mutate(numTrans = as.numeric(numTrans)) %>%
+  # Select duration and artist_familiarity
+  select(UniqueID, pointtypeid, numTrans) %>%
+  # Bucketize duration
+  ft_quantile_discretizer("numTrans", "rating", n.buckets = 5) %>%
+  mutate(logTrans = log(numTrans))
+
+#Partition the Rating dataset into training and testing
+partitioned <- RatingMatrix %>%
+  sdf_partition(training = 0.8, testing = 0.2, seed = 1805)
+
+
+```
+
+
+## Explicit Feedback System
+
+In the below snippet of code I am executing Explicit ALS and obtaining the predicted rating matrix for the Explicit feedback.
+
+The user and item factors were extracted from the algorithm. To obtain the predicted rating matrix we took the product of the two factor matrices.
+
+Following this, I extracted the top 5 recommendations for each user in the predicted rating matrix, which are then compared to the test set data. If the user-item pair in the test set appears in the top 5 recommendations, the model is scored a 1, otherwise 0. It is important to note that the test set was filtered for users that did not appear in the training set. This could be due to "cold-start", or newer users who were not in the training data.
+
+Note that the seed used in the Spark ALS algorithm is not functional (this functionality may be introduced in future versions of Spark) - thus the results are not reproducible. However, in the several test runs I ran the Implicit Feedback System outperformed the Explicit Feedback System. 
+
+```{r, eval = FALSE}
+
+################################################## Explicit Model #############################################
+
+#Run the explicit ALS model on the Rating dataset
+model_als_explicit <- ml_als_factorization(partitioned$training, rating.column = "rating", user.column = "UniqueID",
+                                           item.column = "pointtypeid",iter.max = 20, regularization.parameter = 0.1, nonnegative = TRUE, 
+                                           seed= 1805)
+
+#Extract the user and item factor matrices from the explicit ALS model
+user_factor_mat_explicit <- as.matrix(model_als_explicit$user.factors)
+item_factor_mat_explicit <- as.matrix(model_als_explicit$item.factors)
+
+#Perform matrix multiplication to obtain the prediction matrix, containing each user and their predicted rating for each point type
+pred_matrix_explicit <- user_factor_mat_explicit[,-c(1)] %*% t(item_factor_mat_explicit[,-c(1)])
+
+#Add the column and row titles to the prediction matrix
+rownames(pred_matrix_explicit) <- paste(user_factor_mat_explicit[,c(1)])
+colnames(pred_matrix_explicit) <- paste(item_factor_mat_explicit[,c(1)])
+
+#Obtain the top 5 recommended points type for each user
+pred_mat_exp_topN <- t(apply(pred_matrix_explicit, 1, FUN= function(x) item_factor_mat_explicit[,c(1)][order(-x)[1:5]]))
+
+#Add column names to the top recommended item columns
+colnames(pred_mat_exp_topN) <- paste("top_item", 1:5, sep="_")
+
+#Obtain a list of IDs from the prediction matrix. This represents the users we have predictions for
+prediction_IDs_exp <- as.numeric(rownames(pred_mat_exp_topN))
+
+#Filter the test set for the accounts that do not appear in the prediction matrix - these are most likely accounts 
+#   that are new (cold start) or have low activity and hence do not appear in the training
+testing_filtered_exp <- partitioned$testing %>%
+  filter(UniqueID %in% prediction_IDs_exp)
+
+#Bind the IDs of the prediction matrix back as an explicit column, currently the IDs are listed as rownames in the matrix
+pred_mat_exp_topN <- cbind(pred_mat_exp_topN, prediction_IDs_exp)
+colnames(pred_mat_exp_topN)[which(colnames(pred_mat_exp_topN) == "prediction_IDs_exp")] <- "UniqueID"
+
+#Convert prediction matrix to Spark and then join the predictions to the test set
+pred_mat_exp_topN <- sdf_copy_to(sc, pred_mat_exp_topN)
+testing_predictions_exp <- inner_join(testing_filtered_exp, pred_mat_exp_topN, by = "UniqueID")
+
+#Check if the transaction in the test dataset appears in the top 5 recommended items
+testing_predictions_exp <- testing_predictions_exp %>%
+  mutate(correct_prediction = ifelse((pointtypeid==top_item_1 | pointtypeid==top_item_2 | pointtypeid==top_item_3 | 
+                                        pointtypeid==top_item_4 | pointtypeid==top_item_5), 1, 0) )
+
+#Obtain the percentage of transactions where the top 5 recommendations contain the transaction
+testing_predictions_exp %>%
+  summarize(accuracy = sum(correct_prediction)/n() * 100)
+
+
+```
+
+## Implicit Feedback System
+
+The same process as the Explicit Feedback System, but using the Implicit ALS algorithm. Note that in future versions the redundant code would be placed in a function, which is then called. 
+
+```{r, eval = FALSE}
+################################################## Implicit Model ##########################################
+
+#Run Implicit ALS model. 
+model_als_implicit <- ml_als_factorization(partitioned$training, rating.column = "logTrans", user.column = "UniqueID",
+                                           item.column = "pointtypeid",iter.max = 15, regularization.parameter = 0.1,
+                                           implicit.preferences = TRUE, alpha = 20, nonnegative = TRUE, set.seed = 1805)
+
+#Extract the user and item factor matrices from the implicit ALS model
+user_factor_mat_implicit <- as.matrix(model_als_implicit$user.factors)
+item_factor_mat_implicit <- as.matrix(model_als_implicit$item.factors)
+
+#Perform matrix multiplication to obtain the prediction matrix, containing each user and their predicted rating for each point type
+pred_matrix_implicit <- user_factor_mat_implicit[,-c(1)] %*% t(item_factor_mat_implicit[,-c(1)])
+
+#Add the column and row titles to the prediction matrix
+rownames(pred_matrix_implicit) <- paste(user_factor_mat_implicit[,c(1)])
+colnames(pred_matrix_implicit) <- paste(item_factor_mat_implicit[,c(1)])
+
+#Obtain the top 5 recommended points type for each user
+pred_mat_imp_topN <- t(apply(pred_matrix_implicit, 1, FUN= function(x) item_factor_mat_implicit[,c(1)][order(-x)[1:5]]))
+
+#Add column names to the top recommended item columns
+colnames(pred_mat_imp_topN) <- paste("top_item", 1:5, sep="_")
+
+#Obtain a list of IDs from the prediction matrix. This represents the users we have predictions for
+prediction_IDs_imp <- as.numeric(rownames(pred_mat_imp_topN))
+
+#Filter the test set for the accounts that do not appear in the prediction matrix - these are most likely accounts 
+#   that are new (cold start) or have low activity and hence do not appear in the training
+testing_filtered_imp <- partitioned$testing %>%
+  filter(UniqueID %in% prediction_IDs_imp)
+
+#Bind the IDs of the prediction matrix back as an implicit column, currently the IDs are listed as rownames in the matrix
+pred_mat_imp_topN <- cbind(pred_mat_imp_topN, prediction_IDs_imp)
+colnames(pred_mat_imp_topN)[which(colnames(pred_mat_imp_topN) == "prediction_IDs_imp")] <- "UniqueID"
+
+#Convert prediction matrix to Spark and then join the predictions to the test set
+pred_mat_imp_topN <- sdf_copy_to(sc, pred_mat_imp_topN)
+testing_predictions_imp <- inner_join(testing_filtered_imp, pred_mat_imp_topN, by = "UniqueID")
+
+#Check if the transaction in the test dataset appears in the top 5 recommended items
+testing_predictions_imp <- testing_predictions_imp %>%
+  mutate(correct_prediction = ifelse((pointtypeid==top_item_1 | pointtypeid==top_item_2 | pointtypeid==top_item_3 | 
+                                        pointtypeid==top_item_4 | pointtypeid==top_item_5), 1, 0) )
+
+#Obtain the percentage of transactions where the top 5 recommendations contain the transaction
+testing_predictions_imp %>%
+  summarize(accuracy = sum(correct_prediction)/n() * 100)
+
+
+
+```
